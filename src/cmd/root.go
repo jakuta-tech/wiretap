@@ -5,25 +5,43 @@ import (
 	"fmt"
 	"log"
 	"net/netip"
+	"net"
 	"os"
+	"strconv"
 
 	"github.com/fatih/color"
 	"github.com/spf13/cobra"
 )
 
+const USE_ENDPOINT_PORT = -1
+
 // Defaults shared by multiple commands.
 var (
-	Version      = "v0.0.0"
-	Endpoint     = ""
-	Port         = 51820
-	Config       = "wiretap.conf"
-	ServerConfig = "wiretap_server.conf"
-	Keepalive    = 25
-	ShowHidden   = false
-	ApiAddr      = netip.MustParsePrefix("a::/128")
-	ApiPort      = 80
-	Subnet4      = netip.MustParsePrefix("192.168.0.0/24")
-	Subnet6      = netip.MustParsePrefix("fd::/64")
+	Version            = "v0.0.0"
+	Endpoint           = ""
+	Port               = 51820
+	E2EEPort           = 51821
+	ConfigRelay        = "wiretap_relay.conf"
+	ConfigE2EE         = "wiretap.conf"
+	ConfigServer       = "wiretap_server.conf"
+	Keepalive          = 25
+	MTU                = 1420
+	ShowHidden         = false
+	ApiSubnets         = netip.MustParsePrefix("::/8")
+	ApiV4Subnets       = netip.MustParsePrefix("192.0.2.0/24")
+	ApiPort            = 80
+	ClientRelaySubnet4 = netip.MustParsePrefix("172.16.0.0/16")
+	ClientRelaySubnet6 = netip.MustParsePrefix("fd:16::/40")
+	RelaySubnets4      = netip.MustParsePrefix("172.17.0.0/16")
+	RelaySubnets6      = netip.MustParsePrefix("fd:17::/40")
+	E2EESubnets4       = netip.MustParsePrefix("172.18.0.0/16")
+	E2EESubnets6       = netip.MustParsePrefix("fd:18::/40")
+	ClientE2EESubnet4  = netip.MustParsePrefix("172.19.0.0/16")
+	ClientE2EESubnet6  = netip.MustParsePrefix("fd:19::/40")
+	SubnetV4Bits       = 24
+	SubnetV6Bits       = 48
+	APIBits            = 16
+	APIV4Bits          = 24
 )
 
 // Define colors.
@@ -57,7 +75,7 @@ var rootCmd = &cobra.Command{
 
 // Execute starts command handling, called by main.
 func Execute() {
-	rootCmd.PersistentFlags().BoolVarP(&ShowHidden, "show-hidden", "", ShowHidden, "show hidden flag options")
+	rootCmd.PersistentFlags().BoolVarP(&ShowHidden, "show-hidden", "H", ShowHidden, "show hidden flag options")
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -69,4 +87,14 @@ func check(message string, err error) {
 	if err != nil {
 		log.Fatalf("%s: %v", message, err)
 	}
+}
+
+// Extract the port from the endpoint string 
+func portFromEndpoint(endpoint string) int {
+	_, strPort, err := net.SplitHostPort(endpoint)
+	check("cannot extract port from endpoint argument", err);
+	
+	p, err := strconv.Atoi(strPort);
+	check("cannot extract port from endpoint argument", err);
+	return p;
 }

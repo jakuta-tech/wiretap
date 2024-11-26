@@ -1,3 +1,5 @@
+// Package udp proxies UDP messages between a WireGuard peer and a destination accessible
+// by the machine where Wiretap is running.
 package udp
 
 import (
@@ -23,7 +25,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
-	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 
 	"wiretap/transport"
 )
@@ -44,28 +45,28 @@ var sourceMap = make(map[netip.AddrPort]dialerCount)
 var sourceMapLock = sync.RWMutex{}
 
 // source and destination -> dialer
-var connMap = make(map[udpConn](chan *stack.PacketBuffer))
+var connMap = make(map[udpConn](chan stack.PacketBufferPtr))
 var connMapLock = sync.RWMutex{}
 
-// preroutingMatch matches packets in the prerouting stage.
-type preroutingMatch struct{}
+type Config struct {
+	Tnet      *netstack.Net
+	StackLock *sync.Mutex
+}
 
-var s *stack.Stack
+// Handler handles UDP packets. Returns function that returns true if packet is handled, or false if ICMP Destination Unreachable should be sent.
+// TODO: Clean this up. Can't use UDPForwarder because it doesn't offer a way to return false, which is required to send Unreachables.
+func Handler(c Config) func(stack.TransportEndpointID, stack.PacketBufferPtr) bool {
+	return func(teid stack.TransportEndpointID, pkb stack.PacketBufferPtr) bool {
+		log.Printf("(client %s) - Transport: UDP -> %s", net.JoinHostPort(teid.RemoteAddress.String(), fmt.Sprint(teid.RemotePort)), net.JoinHostPort(teid.LocalAddress.String(), fmt.Sprint(teid.LocalPort)))
 
-// Match rejects all packets, but clones every prerouting packet to the packet handler.
-func (m preroutingMatch) Match(hook stack.Hook, packet *stack.PacketBuffer, inputInterfaceName, outputInterfaceName string) (matches bool, hotdrop bool) {
-	if hook == stack.Prerouting {
-		packetClone := packet.Clone()
+		packetClone := pkb.Clone()
 		go func() {
-			newPacket(packetClone)
+			newPacket(packetClone, c.Tnet.Stack())
 			packetClone.DecRef()
 		}()
 
-		// Taking control of packet, hotdrop.
-		return false, true
+		return true
 	}
-
-	return false, false
 }
 
 func sourceMapLookup(n netip.AddrPort) (dialerCount, bool) {
@@ -102,7 +103,7 @@ func sourceMapDecrement(n netip.AddrPort) {
 	sourceMapLock.Unlock()
 }
 
-func connMapWrite(c udpConn, pktChan chan *stack.PacketBuffer) {
+func connMapWrite(c udpConn, pktChan chan stack.PacketBufferPtr) {
 	connMapLock.Lock()
 	connMap[c] = pktChan
 	connMapLock.Unlock()
@@ -114,7 +115,7 @@ func connMapDelete(c udpConn) {
 	connMapLock.Unlock()
 }
 
-func connMapLookup(c udpConn) (chan *stack.PacketBuffer, bool) {
+func connMapLookup(c udpConn) (chan stack.PacketBufferPtr, bool) {
 	connMapLock.RLock()
 	pktChan, ok := connMap[c]
 	connMapLock.RUnlock()
@@ -122,23 +123,21 @@ func connMapLookup(c udpConn) (chan *stack.PacketBuffer, bool) {
 	return pktChan, ok
 }
 
-func getDataFromPacket(packet *stack.PacketBuffer) []byte {
+func getDataFromPacket(packet stack.PacketBufferPtr) []byte {
 	netHeader := packet.Network()
 	transHeader := header.UDP(netHeader.Payload())
 	return transHeader.Payload()
 }
 
 // NewPacket handles every new packet and sending it to the proper UDP dialer.
-func newPacket(packet *stack.PacketBuffer) {
+func newPacket(packet stack.PacketBufferPtr, s *stack.Stack) {
 	netHeader := packet.Network()
 	transHeader := header.UDP(netHeader.Payload())
 
 	source := netip.MustParseAddrPort(net.JoinHostPort(netHeader.SourceAddress().String(), fmt.Sprint(transHeader.SourcePort())))
 	dest := netip.MustParseAddrPort(net.JoinHostPort(netHeader.DestinationAddress().String(), fmt.Sprint(transHeader.DestinationPort())))
 
-	log.Printf("(client %v) - Transport: UDP -> %v", source, dest)
-
-	var pktChan chan *stack.PacketBuffer
+	var pktChan chan stack.PacketBufferPtr
 	var ok bool
 
 	conn := udpConn{Source: source, Dest: dest}
@@ -158,74 +157,31 @@ func newPacket(packet *stack.PacketBuffer) {
 	}
 
 	// New packet channel and dialer need to be created.
-	pktChan = make(chan *stack.PacketBuffer, 1)
+	pktChan = make(chan stack.PacketBufferPtr, 1)
 	connMapWrite(conn, pktChan)
 
-	go handleConn(conn, port)
+	go handleConn(conn, port, s)
 
 	pktChan <- packet.Clone()
 }
 
-// Handle creates a DNAT rule that forwards destination packets to a udp listener.
-// Once a connection is accepted, it gets handed off to handleConn().
-func Handle(tnet *netstack.Net, ipv4Addr netip.Addr, ipv6Addr netip.Addr, port uint16, lock *sync.Mutex) {
-	s = tnet.Stack()
-
-	// Create NATing firewall rule.
-	// iptables -t nat -A PREROUTING -p udp -j DNAT --to-destination <addr>:<port>
-	headerFilter := stack.IPHeaderFilter{
-		Protocol:      udp.ProtocolNumber,
-		CheckProtocol: true,
-	}
-
-	match := preroutingMatch{}
-
-	rule4 := stack.Rule{
-		Filter:   headerFilter,
-		Matchers: []stack.Matcher{match},
-		Target: &stack.DNATTarget{
-			Addr:            tcpip.Address(ipv4Addr.AsSlice()),
-			Port:            port,
-			NetworkProtocol: ipv4.ProtocolNumber,
-		},
-	}
-
-	rule6 := stack.Rule{
-		Filter:   headerFilter,
-		Matchers: []stack.Matcher{match},
-		Target: &stack.DNATTarget{
-			Addr:            tcpip.Address(ipv6Addr.AsSlice()),
-			Port:            port,
-			NetworkProtocol: ipv6.ProtocolNumber,
-		},
-	}
-
-	tid := stack.NATID
-	transport.PushRule(s, rule4, tid, false)
-	transport.PushRule(s, rule6, tid, true)
-	lock.Unlock()
-
-	// UDP listener is handled in the prerouting rule, we can return.
-	log.Println("Transport: UDP listener up")
-}
-
 // handleConn proxies traffic between a source and destination.
-func handleConn(conn udpConn, port int) {
+func handleConn(conn udpConn, port int, s *stack.Stack) {
 	defer func() {
 		connMapDelete(conn)
 	}()
 
-	var mostRecentPacket *stack.PacketBuffer
+	var mostRecentPacket stack.PacketBufferPtr
 
 	// New dialer from source to destination.
 	laddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf(":%d", port))
 	if err != nil {
-		log.Println("Failed to parse laddr", err)
+		log.Println("failed to parse laddr", err)
 		return
 	}
 	raddr, err := net.ResolveUDPAddr("udp", conn.Dest.String())
 	if err != nil {
-		log.Println("Failed to parse raddr", err)
+		log.Println("failed to parse raddr", err)
 		return
 	}
 
@@ -233,7 +189,7 @@ func handleConn(conn udpConn, port int) {
 	// Would like to use ListenUDP, but we don't get ICMP unreachable.
 	newConn, err := reuse.Dial("udp", laddr.String(), raddr.String())
 	if err != nil {
-		log.Println("Failed new UDP bind", err)
+		log.Println("failed new UDP bind", err)
 		return
 	}
 	defer newConn.Close()
@@ -248,7 +204,7 @@ func handleConn(conn udpConn, port int) {
 
 	err = newConn.SetDeadline(time.Now().Add(30 * time.Second))
 	if err != nil {
-		log.Println("Failed to set deadline", err)
+		log.Println("failed to set deadline", err)
 	}
 
 	// Sends packet from peer to destination.
@@ -256,7 +212,7 @@ func handleConn(conn udpConn, port int) {
 		for {
 			pktChan, _ := connMapLookup(conn)
 			pkt := <-pktChan
-			// Exit if packet is nil, other goroutine wants us to close.
+			// Exit if packet is empty, other goroutine wants us to close.
 			if pkt == nil {
 				return
 			}
@@ -268,7 +224,7 @@ func handleConn(conn udpConn, port int) {
 			_, err := newConn.Write(data)
 			pkt.DecRef()
 			if err != nil {
-				log.Println("Error sending packet:", err)
+				log.Println("error sending packet:", err)
 				newConn.Close()
 				return
 			}
@@ -276,7 +232,7 @@ func handleConn(conn udpConn, port int) {
 			// Reset timer, we got a packet.
 			err = newConn.SetDeadline(time.Now().Add(30 * time.Second))
 			if err != nil {
-				log.Println("Failed to set deadline:", err)
+				log.Println("failed to set deadline:", err)
 			}
 		}
 	}()
@@ -290,12 +246,12 @@ func handleConn(conn udpConn, port int) {
 			if oerr, ok := err.(*net.OpError); ok {
 				if syserr, ok := oerr.Err.(*os.SyscallError); ok {
 					if syserr.Err == syscall.ECONNREFUSED {
-						go sendUnreachable(mostRecentPacket)
+						go sendUnreachable(mostRecentPacket, s)
 					}
 				}
 			}
 
-			// Force closing of goroutine by reinjecting buffer.
+			// Force closing of goroutine by injecting nil pointer
 			newConn.Close()
 			pktChan, ok := connMapLookup(conn)
 			if ok {
@@ -307,17 +263,17 @@ func handleConn(conn udpConn, port int) {
 		// Reset timer, we got a packet.
 		err = newConn.SetDeadline(time.Now().Add(30 * time.Second))
 		if err != nil {
-			log.Println("Failed to set deadline:", err)
+			log.Println("failed to set deadline:", err)
 		}
 
 		// Write packet back to peer.
-		sendResponse(conn, newBuf[:n])
+		sendResponse(conn, newBuf[:n], s)
 	}
 }
 
 // sendResponse builds a UDP packet to return to the peer.
 // TCP doesn't need this because the NATing works fine, but with UDP the OriginalDst function fails.
-func sendResponse(conn udpConn, data []byte) {
+func sendResponse(conn udpConn, data []byte, s *stack.Stack) {
 	var err error
 	var ipv4Layer *layers.IPv4
 	var ipv6Layer *layers.IPv6
@@ -349,7 +305,7 @@ func sendResponse(conn udpConn, data []byte) {
 		err = udpLayer.SetNetworkLayerForChecksum(ipv4Layer)
 	}
 	if err != nil {
-		log.Println("Failed to marshal response:", err)
+		log.Println("failed to marshal response:", err)
 		return
 	}
 
@@ -376,20 +332,20 @@ func sendResponse(conn udpConn, data []byte) {
 	}
 
 	if err != nil {
-		log.Println("Failed to serialize layers:", err)
+		log.Println("failed to serialize layers:", err)
 		return
 	}
 
-	tcpipErr := transport.SendPacket(s, buf.Bytes(), &tcpip.FullAddress{NIC: 1, Addr: tcpip.Address(conn.Source.Addr().AsSlice())}, proto)
+	tcpipErr := transport.SendPacket(s, buf.Bytes(), &tcpip.FullAddress{NIC: 1, Addr: tcpip.AddrFromSlice(conn.Source.Addr().AsSlice())}, proto)
 	if tcpipErr != nil {
-		log.Println("Failed to write:", tcpipErr)
+		log.Println("failed to write:", tcpipErr)
 		return
 	}
 }
 
 // sendUnreachable sends an ICMP Port Unreachable packet to peer as if from
 // the original destination of the packet.
-func sendUnreachable(packet *stack.PacketBuffer) {
+func sendUnreachable(packet stack.PacketBufferPtr, s *stack.Stack) {
 	var err error
 	var ipv4Layer *layers.IPv4
 	var ipv6Layer *layers.IPv6
@@ -401,13 +357,13 @@ func sendUnreachable(packet *stack.PacketBuffer) {
 	transHeader.SetChecksum(0)
 	transHeaderPayload := transHeader.Payload()
 
-	isIpv6 := netHeader.DestinationAddress().To4() == ""
+	isIpv6 := netHeader.DestinationAddress().To4() == tcpip.Address{}
 
 	if isIpv6 {
 		ipv6Layer = &layers.IPv6{}
 		ipv6Layer, err = transport.GetNetworkLayer[header.IPv6](netHeader, ipv6Layer)
 		if err != nil {
-			log.Println("Could not decode Network header:", err)
+			log.Println("could not decode Network header:", err)
 			return
 		}
 		ipv6Layer = &layers.IPv6{
@@ -419,7 +375,7 @@ func sendUnreachable(packet *stack.PacketBuffer) {
 		}
 		ipv6Header, ok := netHeader.(header.IPv6)
 		if !ok {
-			log.Println("Could not type assert IPv6 Network Header")
+			log.Println("could not type assert IPv6 Network Header")
 			return
 		}
 		icmpLayer, err = (&neticmp.Message{
@@ -434,7 +390,7 @@ func sendUnreachable(packet *stack.PacketBuffer) {
 		ipv4Layer = &layers.IPv4{}
 		ipv4Layer, err = transport.GetNetworkLayer[header.IPv4](netHeader, ipv4Layer)
 		if err != nil {
-			log.Println("Could not decode Network header:", err)
+			log.Println("could not decode Network header:", err)
 			return
 		}
 		ipv4Layer = &layers.IPv4{
@@ -447,7 +403,7 @@ func sendUnreachable(packet *stack.PacketBuffer) {
 		}
 		ipv4Header, ok := netHeader.(header.IPv4)
 		if !ok {
-			log.Println("Could not type assert IPv6 Network Header")
+			log.Println("could not type assert IPv6 Network Header")
 			return
 		}
 		icmpLayer, err = (&neticmp.Message{
@@ -460,7 +416,7 @@ func sendUnreachable(packet *stack.PacketBuffer) {
 		ipv4Layer.Length = uint16((int(ipv4Layer.IHL) * 4) + len(icmpLayer))
 	}
 	if err != nil {
-		log.Println("Failed to marshal response:", err)
+		log.Println("failed to marshal response:", err)
 		return
 	}
 
@@ -481,7 +437,7 @@ func sendUnreachable(packet *stack.PacketBuffer) {
 		)
 	}
 	if err != nil {
-		log.Println("Failed to serialize layers:", err)
+		log.Println("failed to serialize layers:", err)
 		return
 	}
 
@@ -489,7 +445,7 @@ func sendUnreachable(packet *stack.PacketBuffer) {
 
 	tcpipErr := transport.SendPacket(s, response, &tcpip.FullAddress{NIC: 1, Addr: netHeader.SourceAddress()}, proto)
 	if tcpipErr != nil {
-		log.Println("Failed to write:", tcpipErr)
+		log.Println("failed to write:", tcpipErr)
 		return
 	}
 }

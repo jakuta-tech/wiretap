@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -14,11 +15,13 @@ import (
 type PeerConfig struct {
 	config     wgtypes.PeerConfig
 	privateKey *wgtypes.Key
+	nickname   string
 }
 
 type peerConfigJSON struct {
 	Config     wgtypes.PeerConfig
 	PrivateKey *wgtypes.Key
+	Nickname   string
 }
 
 type PeerConfigArgs struct {
@@ -31,6 +34,7 @@ type PeerConfigArgs struct {
 	ReplaceAllowedIPs           bool
 	AllowedIPs                  []string
 	PrivateKey                  string
+	Nickname                    string
 }
 
 func GetPeerConfig(args PeerConfigArgs) (PeerConfig, error) {
@@ -83,6 +87,13 @@ func GetPeerConfig(args PeerConfigArgs) (PeerConfig, error) {
 			return PeerConfig{}, err
 		}
 	}
+	
+	if args.Nickname != "" {
+		err = c.SetNickname(args.Nickname)
+		if err != nil {
+			return PeerConfig{}, err
+		}
+	}
 
 	return c, nil
 }
@@ -98,6 +109,7 @@ func NewPeerConfig() (PeerConfig, error) {
 			PublicKey: privateKey.PublicKey(),
 		},
 		privateKey: &privateKey,
+		nickname: "",
 	}, nil
 }
 
@@ -105,6 +117,7 @@ func (p *PeerConfig) MarshalJSON() ([]byte, error) {
 	return json.Marshal(peerConfigJSON{
 		p.config,
 		p.privateKey,
+		p.nickname,
 	})
 }
 
@@ -118,6 +131,7 @@ func (p *PeerConfig) UnmarshalJSON(b []byte) error {
 
 	p.config = tmp.Config
 	p.privateKey = tmp.PrivateKey
+	p.nickname = tmp.Nickname
 
 	return nil
 }
@@ -165,6 +179,10 @@ func (p *PeerConfig) SetEndpoint(addr string) error {
 	return nil
 }
 
+func (p *PeerConfig) GetEndpoint() *net.UDPAddr {
+	return p.config.Endpoint
+}
+
 func (p *PeerConfig) SetPersistentKeepaliveInterval(keepalive int) error {
 	secs, err := time.ParseDuration(fmt.Sprintf("%ds", keepalive))
 	if err != nil {
@@ -181,23 +199,38 @@ func (p *PeerConfig) SetReplaceAllowedIPs(replaceAllowedIPs bool) {
 
 func (p *PeerConfig) SetAllowedIPs(allowedIPs []string) error {
 	for _, a := range allowedIPs {
-		// Skip empty allowed IPs
-		if len(a) == 0 {
-			continue
-		}
-		_, ipnet, err := net.ParseCIDR(a)
+		err := p.AddAllowedIPs(a)
 		if err != nil {
 			return err
 		}
-
-		p.config.AllowedIPs = append(p.config.AllowedIPs, *ipnet)
 	}
 
 	return nil
 }
 
+func (p *PeerConfig) AddAllowedIPs(ip string) error {
+	// Skip empty allowed IPs
+	if len(ip) == 0 {
+		return nil
+	}
+
+	_, ipnet, err := net.ParseCIDR(ip)
+	if err != nil {
+		return err
+	}
+
+	p.config.AllowedIPs = append(p.config.AllowedIPs, *ipnet)
+	return nil
+}
+
 func (p *PeerConfig) GetAllowedIPs() []net.IPNet {
 	return p.config.AllowedIPs
+}
+
+func (p *PeerConfig) GetApiAddr() netip.Addr {
+	apiIP := p.config.AllowedIPs[len(p.config.AllowedIPs)-1]
+	apiAddr, _ := netip.AddrFromSlice(apiIP.IP)
+	return apiAddr
 }
 
 func (p *PeerConfig) SetPrivateKey(privateKey string) error {
@@ -211,16 +244,40 @@ func (p *PeerConfig) SetPrivateKey(privateKey string) error {
 	return nil
 }
 
+func (p *PeerConfig) GetNickname() string {
+	return p.nickname
+}
+
+func (p *PeerConfig) SetNickname(nickname string) error {
+	if nickname != "" {
+		p.nickname = nickname
+	}
+	return nil
+}
+
 func (p *PeerConfig) AsFile() string {
 	var s strings.Builder
-
 	s.WriteString("[Peer]\n")
+	
+	if p.nickname != "" {
+		s.WriteString(fmt.Sprintf("%s Nickname = %s\n", CUSTOM_PREFIX, p.nickname))
+	}
+	
 	s.WriteString(fmt.Sprintf("PublicKey = %s\n", p.config.PublicKey.String()))
+	
 	ips := []string{}
 	for _, a := range p.config.AllowedIPs {
 		ips = append(ips, a.String())
 	}
-	s.WriteString(fmt.Sprintf("AllowedIPs = %s\n", strings.Join(ips, ",")))
+	if len(ips) != 0 {
+		s.WriteString(fmt.Sprintf("AllowedIPs = %s\n", strings.Join(ips, ",")))
+	}
+	if p.config.Endpoint != nil {
+		s.WriteString(fmt.Sprintf("Endpoint = %s\n", p.config.Endpoint.String()))
+	}
+	if p.config.PersistentKeepaliveInterval != nil {
+		s.WriteString(fmt.Sprintf("PersistentKeepalive = %d\n", *p.config.PersistentKeepaliveInterval/time.Second))
+	}
 
 	return s.String()
 }
